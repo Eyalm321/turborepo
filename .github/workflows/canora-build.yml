@@ -1,12 +1,13 @@
 name: canora-build
 
-# Builds a musl-static Linux x64 `turbo` from the pnpm-prune peer-variant
+# Builds a musl-static linux/amd64 `turbo` from the pnpm-prune peer-variant
 # fix branch (vercel/turborepo#12819) and publishes it as a release asset.
-# Built natively inside rust:alpine so the binary runs on Alpine (musl)
-# AND glibc — canora-sync's webhook-receiver/inspector-api are Alpine.
 #
-# Lives on the fork default branch (workflow_dispatch discoverability);
-# checks out + builds the fix branch.
+# Build runs on ubuntu (apt's capnp/protoc work for the build scripts —
+# proven by the earlier glibc build) and cross-targets
+# x86_64-unknown-linux-musl via cargo-zigbuild, so the binary is fully
+# static and runs on Alpine (canora-sync webhook-receiver/inspector-api)
+# with no glibc/gcompat shim.
 
 on:
   workflow_dispatch:
@@ -22,26 +23,34 @@ jobs:
         with:
           ref: fix/pnpm-prune-peer-variant-resolution
 
-      - name: Build turbo (musl, native in rust:alpine)
+      - name: Host build tools + musl target + zig
         run: |
-          docker run --rm -v "$PWD":/w -w /w rust:1-alpine sh -c '
-            set -e
-            apk add --no-cache musl-dev build-base capnproto protobuf-dev \
-              openssl-dev openssl-libs-static perl make pkgconf git bash
-            export OPENSSL_STATIC=1 OPENSSL_NO_VENDOR=1 RUSTFLAGS="-C target-feature=-crt-static"
-            cargo build --release -p turbo
-            ./target/release/turbo --version || true
-          '
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            capnproto protobuf-compiler pkg-config python3-pip
+          rustup target add x86_64-unknown-linux-musl
+          pipx install ziglang 2>/dev/null || pip3 install --user ziglang
+          cargo install --locked cargo-zigbuild
+          capnp --version
+
+      - name: Build turbo (musl-static via zigbuild)
+        env:
+          # turbo's openssl-sys: build vendored so musl has no system openssl dep.
+          OPENSSL_STATIC: "1"
+          OPENSSL_NO_VENDOR: "0"
+        run: |
+          cargo zigbuild --release --target x86_64-unknown-linux-musl -p turbo
+          file target/x86_64-unknown-linux-musl/release/turbo
 
       - name: Publish musl binary as a release asset
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p dist
-          cp target/release/turbo dist/turbo-linux-x64-musl
-          file dist/turbo-linux-x64-musl || true
+          cp target/x86_64-unknown-linux-musl/release/turbo dist/turbo-linux-x64-musl
+          dist/turbo-linux-x64-musl --version || true
           TAG="v0.0.0-canora-pnpmfix"
           gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" dist/turbo-linux-x64-musl \
-            --title "turbo (linux x64, musl) — pnpm-prune peer-variant fix" \
-            --notes "musl-static linux x64 turbo built from fix/pnpm-prune-peer-variant-resolution (vercel/turborepo#12819). Runs on Alpine (musl) and glibc. canora-sync fork-validation test asset; not for production."
+            --title "turbo (linux x64, musl-static) — pnpm-prune peer-variant fix" \
+            --notes "musl-static linux/amd64 turbo built (cargo-zigbuild) from fix/pnpm-prune-peer-variant-resolution (vercel/turborepo#12819). Runs on Alpine with no shim. canora-sync fork-validation test asset; not for production."
