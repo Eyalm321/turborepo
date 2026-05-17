@@ -1,0 +1,49 @@
+name: canora-build
+
+# Builds a Linux x64 `turbo` binary from the pnpm-prune peer-variant fix
+# branch (vercel/turborepo#12819) and publishes it as a GitHub release
+# asset so canora-sync's Docker pipeline can consume it by URL — to test
+# the turbo-side fix alongside pnpm canora.14 (and prove the pnpm PR can
+# drop the Bug-1 synthesize when turbo fixes the root cause).
+#
+# Lives on the fork default branch (so workflow_dispatch can find it) but
+# checks out and builds the fix branch. Native ubuntu build.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/pnpm-prune-peer-variant-resolution
+
+      - name: System build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            capnproto protobuf-compiler pkg-config libssl-dev build-essential
+
+      - name: Toolchain info
+        run: rustup show && cargo --version && capnp --version
+
+      - name: Build turbo (release, linux x64)
+        run: cargo build --release -p turbo
+
+      - name: Publish Linux binary as a release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          cp target/release/turbo dist/turbo-linux-x64
+          dist/turbo-linux-x64 --version || true
+          TAG="v0.0.0-canora-pnpmfix"
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" dist/turbo-linux-x64 \
+            --title "turbo (linux x64) — pnpm-prune peer-variant fix" \
+            --notes "Linux x64 turbo built from fix/pnpm-prune-peer-variant-resolution (vercel/turborepo#12819). Consumed by canora-sync fork-validation to test the turbo-side fix alongside pnpm canora.14. Not for production."
