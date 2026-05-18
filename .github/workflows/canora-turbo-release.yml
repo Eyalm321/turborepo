@@ -125,6 +125,7 @@ jobs:
       - name: Publish sha256-pinned release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           tag='${{ steps.ver.outputs.tag }}'
           gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
