@@ -1,0 +1,154 @@
+name: canora-turbo-release
+
+# Maintains the canora-sync patched turbo.
+#
+# Branch model (mirrors Eyalm321/pnpm):
+#   lockfiles/retain-peer-variant-base-entry — upstream PR branch
+#                                              (vercel/turborepo#12825),
+#                                              keeps review history.
+#   canora-patch (built here)                — the single data.rs fix
+#                                              commit on an upstream turbo
+#                                              release tag; build source.
+#
+# Produces a musl-static `turbo-linux-x64-musl` (cargo-zigbuild — runs on
+# Alpine with no glibc/gcompat shim) + a .sha256, published as a release
+# canora-sync's Dockerfiles consume (TURBO_FORK_URL / TURBO_FORK_SHA256).
+#
+# Triggers:
+#   workflow_dispatch — explicit upstream bump: upstream_ref (a turbo tag)
+#                        + rev. Rebase runs and FAILS LOUD on conflict.
+#   schedule (weekly) — rebuilds current canora-patch as-is (no rebase,
+#                        no force-push), date-stamped rev.
+#
+# Lives on the default branch for workflow_dispatch discoverability;
+# checks out canora-patch to build (rebase is ephemeral, never pushed).
+#
+# Drop-out: when vercel/turborepo#12825 merges, drop-out-watch flags it;
+# point canora-sync at stock turbo >= that release and delete canora-patch
+# + this workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream turbo tag to rebase onto (blank = build current canora-patch as-is)"
+        required: false
+        default: ""
+      rev:
+        description: "canora rev N  ->  <turboTag>-canora.N"
+        required: true
+  schedule:
+    - cron: "0 7 * * 1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: canora-turbo-release
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: canora-patch
+          fetch-depth: 0
+
+      - name: Configure git + fetch upstream tags
+        run: |
+          git remote add upstream https://github.com/vercel/turborepo.git 2>/dev/null || true
+          git fetch --tags --quiet upstream
+          git config user.email "canora-bot@users.noreply.github.com"
+          git config user.name  "canora-bot"
+
+      - name: Rebase patch onto upstream ref (FAIL LOUD on conflict)
+        if: ${{ github.event.inputs.upstream_ref != '' }}
+        run: |
+          target='${{ github.event.inputs.upstream_ref }}'
+          echo "Rebasing canora-patch onto ${target} (ephemeral; not pushed)"
+          if ! git rebase "${target}"; then
+            git rebase --abort || true
+            echo "::error::Rebase onto ${target} conflicts — upstream changed crates/turborepo-lockfiles/src/pnpm/data.rs. Resolve canora-patch manually; refusing to ship an unverified patch."
+            exit 1
+          fi
+
+      - name: Resolve version
+        id: ver
+        run: |
+          base=$(git describe --tags --abbrev=0)              # e.g. v2.9.12
+          rev='${{ github.event.inputs.rev }}'
+          [ -z "$rev" ] && rev="$(date -u +%Y%m%d)"
+          echo "tag=${base}-canora.${rev}" >> "$GITHUB_OUTPUT"
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
+
+      - name: System build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            capnproto protobuf-compiler pkg-config libssl-dev build-essential \
+            xz-utils curl
+
+      - name: Rust toolchain + musl target
+        run: |
+          rustup show
+          rustup target add x86_64-unknown-linux-musl
+          cargo --version && capnp --version
+
+      - name: Install zig (official tarball) + cargo-zigbuild
+        run: |
+          ZIG_VERSION=0.13.0
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/zig" && tar -xJf /tmp/zig.tar.xz -C "$HOME/zig" --strip-components=1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+          "$HOME/zig/zig" version
+          cargo install --locked cargo-zigbuild
+
+      - name: Gate - cargo test -p turborepo-lockfiles
+        run: cargo test -p turborepo-lockfiles
+
+      - name: Build musl-static turbo (cargo-zigbuild)
+        run: cargo zigbuild --release -p turbo --target x86_64-unknown-linux-musl
+
+      - name: Package + sha256
+        id: pack
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/turbo dist/turbo-linux-x64-musl
+          ./dist/turbo-linux-x64-musl --version || true
+          file dist/turbo-linux-x64-musl || true
+          sha=$(sha256sum dist/turbo-linux-x64-musl | cut -d' ' -f1)
+          echo "$sha  turbo-linux-x64-musl" > dist/turbo-linux-x64-musl.sha256
+          echo "sha256=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish sha256-pinned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag='${{ steps.ver.outputs.tag }}'
+          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$tag" \
+            dist/turbo-linux-x64-musl dist/turbo-linux-x64-musl.sha256 \
+            --title "turbo ${{ steps.ver.outputs.base }} + canora prune fix (${tag})" \
+            --notes "musl-static turbo (Alpine-runnable, no shim) from canora-patch (vercel/turborepo#12825 — retain base packages entry for peer-variant injected deps). cargo test -p turborepo-lockfiles passed. sha256 ${{ steps.pack.outputs.sha256 }}"
+          {
+            echo "### canora-sync bump (paste into the Dockerfile ARGs)"
+            echo '```'
+            echo "TURBO_FORK_URL=https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/turbo-linux-x64-musl"
+            echo "TURBO_FORK_SHA256=${{ steps.pack.outputs.sha256 }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  drop-out-watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Flag fork retirement if vercel/turborepo#12825 merged
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          state=$(gh pr view 12825 --repo vercel/turborepo --json state --jq '.state' 2>/dev/null || echo UNKNOWN)
+          echo "vercel/turborepo#12825 state: ${state}"
+          if [ "$state" = "MERGED" ]; then
+            echo "::warning::vercel/turborepo#12825 is MERGED — retire the turbo fork: point canora-sync at stock turbo >= that release, delete canora-patch + this workflow."
+          fi
