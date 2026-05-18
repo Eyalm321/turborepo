@@ -63,23 +63,44 @@ jobs:
           git config user.email "canora-bot@users.noreply.github.com"
           git config user.name  "canora-bot"
 
-      - name: Rebase patch onto upstream ref (FAIL LOUD on conflict)
-        if: ${{ github.event.inputs.upstream_ref != '' }}
+      - name: Resolve upstream target (manual input, else latest stable)
+        id: tgt
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          target='${{ github.event.inputs.upstream_ref }}'
-          echo "Rebasing canora-patch onto ${target} (ephemeral; not pushed)"
+          t='${{ github.event.inputs.upstream_ref }}'
+          if [ -z "$t" ]; then
+            t=$(gh api repos/vercel/turborepo/releases/latest --jq '.tag_name')
+          fi
+          echo "target=$t" >> "$GITHUB_OUTPUT"
+          echo "Upstream target: $t"
+
+      - name: Rebase patch onto target (FAIL-SAFE — conflict aborts, no ship)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          target='${{ steps.tgt.outputs.target }}'
+          echo "Rebasing canora-patch onto ${target}"
           if ! git rebase "${target}"; then
             git rebase --abort || true
-            echo "::error::Rebase onto ${target} conflicts — upstream changed crates/turborepo-lockfiles/src/pnpm/data.rs. Resolve canora-patch manually; refusing to ship an unverified patch."
+            gh issue create \
+              --title "canora-patch: weekly rebase onto ${target} conflicts" \
+              --body "Upstream ${target} changed crates/turborepo-lockfiles/src/pnpm/data.rs (the patched file). canora-sync stays on the last-good release (nothing shipped). Resolve canora-patch manually, then re-run canora-turbo-release." 2>/dev/null || true
+            echo "::error::Rebase onto ${target} conflicts — last-good release kept; alert issue opened. Refusing to ship an unverified patch."
             exit 1
           fi
+          # Keep the maintenance branch current (our branch; safe force).
+          git push --force-with-lease origin canora-patch
 
       - name: Resolve version
         id: ver
         run: |
           base=$(git describe --tags --abbrev=0)              # e.g. v2.9.12
           rev='${{ github.event.inputs.rev }}'
-          [ -z "$rev" ] && rev="$(date -u +%Y%m%d)"
+          # Deterministic: short SHA of the rebased patch — idempotent when
+          # upstream is unchanged; changes only on a new upstream release.
+          [ -z "$rev" ] && rev="$(git rev-parse --short=7 HEAD)"
           echo "tag=${base}-canora.${rev}" >> "$GITHUB_OUTPUT"
           echo "base=${base}" >> "$GITHUB_OUTPUT"
 
